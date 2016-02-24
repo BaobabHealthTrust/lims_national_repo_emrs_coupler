@@ -453,6 +453,8 @@ class LimsController < ApplicationController
 
     json = do_query(params[:id])
 
+    patient_id = Order.find_by_accession_number(params[:id]).patient_id rescue nil
+
     rows = ""
 
     (0..(json['test_types'].length - 1)).each do |i|
@@ -592,7 +594,7 @@ EOF
             <tr>
               <td style="background-color: #333;">
                 <div style="height: 80px;" class="buttonsDiv">
-                  <button class="green" style="float: right;" onmousedown="window.location='/'">
+                  <button class="green" style="float: right;" onmousedown="window.location='/patients/show/#{patient_id}'">
                     <span>Finish</span>
                   </button>
                   <!--button class="blue" style="float: right;"
@@ -1734,6 +1736,166 @@ EOF
 
     redirect_to "/lims/show/#{json['_id']}"
 
+  end
+
+  def generic_results
+    @results = []
+    @patient = Patient.find(params[:id])
+    patient_ids = id_identifiers(@patient)
+    @patient_bean = PatientService.get_patient(@patient.person)
+    # (Lab.results(@patient, patient_ids) || []).map do | short_name , test_name , range , value , test_date |
+    #  @results << [short_name.gsub('_',' '),"/lab/view?test=#{short_name}&patient_id=#{@patient.id}"]
+    # end
+
+    Observation.all(:conditions => ["person_id = ? AND concept_id = ?", params[:id],
+                                    (ConceptName.find_by_name("Laboratory tests ordered").concept_id rescue nil)]).each do |obs|
+
+      @results << [obs.value_text, "/lab/view?test=#{obs.value_text.gsub(/\s/, "+")}&patient_id=#{@patient.id}"]
+
+    end
+
+    @enter_lab_results = GlobalProperty.find_by_property('enter.lab.results').property_value == 'true' rescue false
+    render :layout => 'menu', :template => '/lab/results'
+  end
+
+  def generic_view
+    @patient = Patient.find(params[:patient_id])
+    @patient_bean = PatientService.get_patient(@patient.person)
+    @test = params[:test]
+    patient_ids = id_identifiers(@patient)
+    # @results = Lab.results_by_type(@patient, @test, patient_ids)
+
+    @results = {}
+
+    Observation.all(:conditions => ["person_id = ? AND concept_id = ? AND value_text = ?", params[:patient_id],
+                                    (ConceptName.find_by_name("Laboratory tests ordered").concept_id rescue nil),
+                                    @test
+    ]).each do |obs|
+
+      Observation.all(:conditions => ["person_id = ? AND concept_id = ? AND obs_group_id = ?", params[:patient_id],
+                                      (ConceptName.find_by_name("Lab test result").concept_id rescue nil), obs.obs_id]).each do |result|
+
+        key = "#{obs.obs_datetime.to_date.strftime("%Y-%m-%d") rescue "????-??-??"}::#{result.value_text rescue nil}"
+
+        test_result = Observation.find_by_person_id_and_concept_id_and_obs_group_id(params[:patient_id],
+                                                                                    (ConceptName.find_by_name("Given lab results").concept_id rescue nil),
+                                                                                    result.obs_id).value_text rescue nil
+
+        @results[key] = {
+            "TestValue" => test_result
+        }
+
+      end
+
+    end
+
+    @all = {}
+    (@results || []).map do |key, values|
+      date = key.split("::")[0].to_date rescue "1900-01-01".to_date
+      name = key.split("::")[1].strip
+      value = values["TestValue"]
+      next if date == "1900-01-01".to_date and value.blank?
+      next if ((Date.today - 2.year) > date)
+      @all[name] = [] if @all[name].blank?
+      @all[name] << [date, value]
+      @all[name] = @all[name].sort
+    end
+
+    @table_th = build_table(@results) unless @results.blank?
+    render :layout => 'menu', :template => '/lab/view'
+  end
+
+  def generic_graph
+    @results = []
+    params[:results].split(';').map do |result|
+
+      date = result.split(',')[0].to_date rescue '1900-01-01'
+      modifier = result.split(',')[1].split(" ")[0].sub('more_than', '>').sub('less_than', '<')
+      value = result.split(',')[1].sub('more_than', '').sub('less_than', '').sub('=', '') rescue nil
+      next if value.blank?
+      value = value.to_f
+
+      @results << [date, value, modifier]
+    end
+
+    @patient = Patient.find(params[:patient_id])
+    @patient_bean = PatientService.get_patient(@patient.person)
+    @type = params[:type]
+    @test = params[:test]
+    render :layout => 'menu', :template => '/lab/graph'
+  end
+
+  def build_table(results)
+    available_dates = Array.new()
+    available_test_types = Array.new()
+    html_tag = Array.new()
+    html_tag_to_display = nil
+
+    results.each do |key, values|
+      date = key.split("::")[0].to_date rescue 'Unknown'
+      available_dates << date
+      available_test_types << key.split("::")[1]
+    end
+
+    available_dates = available_dates.compact.uniq.sort.reverse rescue []
+    available_test_types = available_test_types.compact.uniq rescue []
+    return if available_dates.blank?
+
+
+    #from the available test dates we create
+    #the top row which holds all the lab run test date  - quick hack :)
+    @table_tr = "<tr><th>&nbsp;</th>"; count = 0
+    available_dates.map do |date|
+      @table_tr += "<th id='#{count+=1}'>#{date}</th>"
+    end; @table_tr += "</tr>"
+
+    #same here - we create all the row which will hold the actual
+    #lab results .. quick hack :)
+    @table_tr_data = ''
+    available_test_types.map do |type|
+      @table_tr_data += "<tr><td><a href = '#' onmousedown=\"graph('#{type}');\">#{type.gsub('_', ' ')}</a></td>"
+      count = 0
+      available_dates.map do |date|
+        @table_tr_data += "<td id = '#{type}_#{count+=1}' id='#{date}::#{type}'></td>"
+      end
+      @table_tr_data += "</tr>"
+    end
+
+    results.each do |key, values|
+      value = values['Range'].to_s + ' ' + values['TestValue'].to_s
+      @table_tr_data = @table_tr_data.sub(" id='#{key}'>", " class=#{}>#{value}")
+    end
+
+
+    return (@table_tr + @table_tr_data)
+  end
+
+  def id_identifiers(patient)
+    identifier_type = ["Legacy Pediatric id", "National id", "Legacy National id", "Old Identification Number"]
+    identifier_types = PatientIdentifierType.find(:all,
+                                                  :conditions => ["name IN (?)", identifier_type]
+    ).collect { |type| type.id }
+
+    identifiers = []
+    PatientIdentifier.find(:all,
+                           :conditions => ["patient_id=? AND identifier_type IN (?)",
+                                           patient.id, identifier_types]).each { |i| identifiers << i.identifier }
+
+    patient_obj = PatientService.get_patient(patient.person)
+
+    ActiveRecord::Base.connection.select_all("SELECT * FROM patient_identifier
+      WHERE identifier_type IN(#{identifier_types.join(',')})
+      AND voided = 1 AND patient_id = #{patient.id}
+      AND void_reason LIKE '%Given new national ID: #{patient_obj.national_id}%'").collect { |r| identifiers << r['identifier'] }
+    return identifiers
+  end
+
+  def generic_series
+    @values = params[:results]
+    @patient = Patient.find(params[:patient_id])
+    @patient_bean = PatientService.get_patient(@patient.person)
+    @test = params[:type]
+    render :layout => 'menu', :template => '/charts/series'
   end
 
 end
